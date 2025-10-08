@@ -367,6 +367,9 @@ def _resolve_id_owner_and_datapath(abs_expr: str):
         return owner, attr, idx
     # Suffix data_path from remaining tokens
     dp = _join_tokens(tokens, id_owner_tok_index + 1, len(tokens))
+    # Remove a leading '.' if the first remaining token is an attribute
+    if dp.startswith('.'):
+        dp = dp[1:]
     data_path, idx = _split_datapath_and_index(dp)
     return id_owner, data_path, idx
 
