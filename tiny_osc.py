@@ -132,8 +132,14 @@ def _apply_timer():
             pass
         return APPLY_INTERVAL
 
+    # Snapshot and clear received values so only fresh packets affect this tick
+    with _lock:
+        _snapshot_rx = dict(_rx_values)
+        _rx_values.clear()
+
     # Apply incoming values to each configured mapping (absolute datapaths)
     mappings = getattr(scn, "oscrec_mappings", [])
+    did_apply_any = False
     for item in mappings:
         # Skip disabled mappings
         try:
@@ -145,15 +151,13 @@ def _apply_timer():
         # Normalize mapping address to start with '/'
         if addr and not addr.startswith('/'):
             addr = '/' + addr
-        val = None
-        with _lock:
-            if addr in _rx_values:
-                val = _rx_values.get(addr)
-            # No hold-last fallback; require fresh value in this frame
+        # Only apply if we have a fresh value for this address in this tick
+        val = _snapshot_rx.get(addr)
         if val is None:
             continue
         try:
             _apply_mapping_value(item, float(val))
+            did_apply_any = True
         except Exception as e:
             print(f"[OSC] Failed to set datapath '{item.datapath}': {e}")
             continue
@@ -177,6 +181,13 @@ def _apply_timer():
             playing = getattr(bpy.context.screen, "is_animation_playing", False)
             if not playing:
                 wm.oscrec_record_keys = False
+    except Exception:
+        pass
+
+    # Batch depsgraph update after applying all values
+    try:
+        if did_apply_any and bpy.context and bpy.context.view_layer:
+            bpy.context.view_layer.update()
     except Exception:
         pass
 
@@ -242,6 +253,12 @@ def _split_owner_and_attr(base_expr: str):
 def _eval_expr(expr: str):
     return eval(expr, {"__builtins__": {} , "bpy": bpy}, {})
 
+def _assign_abs_expr(abs_expr: str, value):
+    """Assign to an absolute Python/RNA expression safely, e.g.
+    bpy.data.objects["Cube"].modifiers["Array"]["Socket_5"] = value
+    """
+    exec(f"{abs_expr} = __v", {"__builtins__": {}, "bpy": bpy, "__v": value}, {})
+
 def _resolve_owner_attr_idx(abs_expr: str):
     """From an absolute expression like bpy.data.objects["Cube"].rotation_euler[2]
     return (owner_object, attr_name, index_or_None)."""
@@ -258,6 +275,100 @@ def _set_absolute_datapath_value(abs_expr: str, value: float):
     else:
         vec = getattr(owner, attr)
         vec[idx] = value
+
+def _tokenize_abs_expr(expr: str):
+    """Tokenize an absolute expression into name/attr/index tokens for progressive evaluation."""
+    tokens = []
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch == '.':
+            # attribute token after dot
+            i += 1
+            j = i
+            while j < n and (expr[j].isalnum() or expr[j] == '_'):
+                j += 1
+            tokens.append(('attr', expr[i:j]))
+            i = j
+        elif ch == '[':
+            # bracket/index token, handle nested brackets and quoted strings
+            start = i
+            i += 1
+            depth = 1
+            in_str = False
+            str_ch = ''
+            while i < n and depth > 0:
+                c = expr[i]
+                if in_str:
+                    if c == str_ch:
+                        in_str = False
+                    elif c == '\\' and i + 1 < n:
+                        i += 1
+                else:
+                    if c in ('"', "'"):
+                        in_str = True
+                        str_ch = c
+                    elif c == '[':
+                        depth += 1
+                    elif c == ']':
+                        depth -= 1
+                i += 1
+            tokens.append(('index', expr[start:i]))
+        else:
+            # initial name token (e.g., bpy)
+            j = i
+            while j < n and (expr[j].isalnum() or expr[j] == '_'):
+                j += 1
+            tokens.append(('name', expr[i:j]))
+            i = j
+    return tokens
+
+def _join_tokens(tokens, start: int, end: int):
+    out = []
+    for k in range(start, end):
+        kind, val = tokens[k]
+        if kind == 'name':
+            out.append(val)
+        elif kind == 'attr':
+            out.append('.'); out.append(val)
+        else:
+            out.append(val)
+    return ''.join(out)
+
+def _split_datapath_and_index(dp: str):
+    """Split trailing numeric [index] from a Blender data_path string."""
+    if dp.endswith(']'):
+        lb = dp.rfind('[')
+        if lb != -1:
+            inner = dp[lb+1:-1]
+            if inner.isdigit():
+                return dp[:lb], int(inner)
+    return dp, None
+
+def _resolve_id_owner_and_datapath(abs_expr: str):
+    """Return (id_owner, data_path, index_or_None) suitable for keyframe_insert.
+    Finds the nearest ID owner in the absolute expression and builds a Blender data_path relative to it."""
+    tokens = _tokenize_abs_expr(abs_expr)
+    id_owner = None
+    id_owner_tok_index = -1
+    for k in range(len(tokens)):
+        prefix = _join_tokens(tokens, 0, k+1)
+        try:
+            obj = _eval_expr(prefix)
+        except Exception:
+            break
+        if hasattr(obj, 'keyframe_insert') or hasattr(obj, 'animation_data'):
+            id_owner = obj
+            id_owner_tok_index = k
+    if id_owner is None:
+        # Fallback to previous resolver
+        owner, attr, idx = _resolve_owner_attr_idx(abs_expr)
+        return owner, attr, idx
+    # Suffix data_path from remaining tokens
+    dp = _join_tokens(tokens, id_owner_tok_index + 1, len(tokens))
+    data_path, idx = _split_datapath_and_index(dp)
+    return id_owner, data_path, idx
 
 def _coerce_for_target(owner, attr: str, idx, value_f: float):
     # Determine target RNA type when AUTO
@@ -296,25 +407,55 @@ def _coerce_for_target(owner, attr: str, idx, value_f: float):
         return int(round(value_f))
     return float(value_f)
 
+def _coerce_for_target_abs(abs_expr: str, value_f: float):
+    """Coerce based on the current value type at abs_expr. Works for bracketed datapaths."""
+    try:
+        cur = _eval_expr(abs_expr)
+    except Exception:
+        return float(value_f)
+    # If cur is a bool-like
+    if isinstance(cur, bool):
+        return bool(value_f > 0.0)
+    # If cur is an int-like (but not bool)
+    if isinstance(cur, int) and not isinstance(cur, bool):
+        return int(round(value_f))
+    # Enum properties often expose strings; try to coerce to nearest int index if numeric, else pass through
+    if isinstance(cur, str):
+        # We cannot derive enum identifiers without RNA; best effort: keep as current when value close to 0/1.
+        # Prefer leaving strings unchanged unless a mapping specifically expects indices.
+        return cur
+    # Fallback to float for vectors and floats
+    try:
+        return float(value_f)
+    except Exception:
+        return value_f
+
 def _apply_mapping_value(item, value_f: float):
     owner, attr, idx = _resolve_owner_attr_idx(item.datapath)
+    # If attr contains bracketed access, use direct expression assignment to support collections
+    if ('[' in attr) or (']' in attr):
+        coerced = _coerce_for_target_abs(item.datapath, value_f)
+        _assign_abs_expr(item.datapath, coerced)
+        _force_owner_update(owner)
+        return
     coerced = _coerce_for_target(owner, attr, idx, value_f)
     if idx is None:
         setattr(owner, attr, coerced)
     else:
         vec = getattr(owner, attr)
         vec[idx] = coerced
+    _force_owner_update(owner)
 
 def _insert_keyframe_for_absolute(abs_expr: str, frame: int):
-    owner, attr, idx = _resolve_owner_attr_idx(abs_expr)
+    owner, data_path, idx = _resolve_id_owner_and_datapath(abs_expr)
     if idx is None:
-        owner.keyframe_insert(data_path=attr, frame=frame)
+        owner.keyframe_insert(data_path=data_path, frame=frame)
     else:
-        owner.keyframe_insert(data_path=attr, index=idx, frame=frame)
+        owner.keyframe_insert(data_path=data_path, index=idx, frame=frame)
     try:
         wm = bpy.context.window_manager if bpy.context is not None else None
         if wm and getattr(wm, "oscrec_record_keys", False):
-            _set_fcurve_mute_for_path(owner, attr, (idx if idx is not None else 0), True)
+            _set_fcurve_mute_for_path(owner, data_path, (idx if idx is not None else 0), True)
     except Exception:
         pass
 
@@ -334,12 +475,11 @@ def _set_fcurve_mute_for_path(id_owner, data_path: str, array_index: int, mute: 
 
 def _set_fcurve_mute_for_absolute(abs_expr: str, mute: bool):
     try:
-        owner, attr, idx = _resolve_owner_attr_idx(abs_expr)
+        owner, data_path, idx = _resolve_id_owner_and_datapath(abs_expr)
         if idx is None:
-            # Try index 0 for scalar fcurves if any
-            _set_fcurve_mute_for_path(owner, attr, 0, mute)
+            _set_fcurve_mute_for_path(owner, data_path, 0, mute)
         else:
-            _set_fcurve_mute_for_path(owner, attr, idx, mute)
+            _set_fcurve_mute_for_path(owner, data_path, idx, mute)
     except Exception:
         pass
 
@@ -360,6 +500,19 @@ def _redraw_editors():
                 area.tag_redraw()
     except Exception:
         pass
+
+def _force_owner_update(owner):
+    """Tag the relevant ID datablock for update. Depsgraph update is batched per tick."""
+    # Tag the relevant ID datablock for update
+    try:
+        owner.update_tag(refresh={'DATA'})
+    except Exception:
+        try:
+            id_owner = getattr(owner, 'id_data', None)
+            if id_owner is not None:
+                id_owner.update_tag(refresh={'DATA'})
+        except Exception:
+            pass
 
 def _set_playback_running(should_play: bool):
     try:
