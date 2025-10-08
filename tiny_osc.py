@@ -2,7 +2,7 @@ bl_info = {
     "name": "Tiny OSC",
     "author": "Hans Willem Gijzel & Cursor A.I.",
     "version": (2, 0, 0),
-    "blender": (4, 5, 3),
+    "blender": (5, 0, 0),
     "location": "View3D > Sidebar > TD Osc",
     "description": "Receive OSC and map message addresses to arbitrary Blender properties via absolute datapaths.",
     "category": "Animation",
