@@ -8,20 +8,19 @@ bl_info = {
     "category": "Animation",
 }
 
-from pickle import TRUE
-import bpy
 import socket
 import struct
 import threading
 
-try:
-    from typing import Dict
-except Exception:
-    Dict = dict
+import bpy
+
+from typing import Dict
 
 # --- Config ---
-DEBUG = False               # set True for console logs
-APPLY_INTERVAL = 0.016      # seconds; ~60 Hz continuous application
+DEBUG = False  # set True for console logs
+APPLY_INTERVAL = 0.016  # seconds; ~60 Hz continuous application
+DEFAULT_OSC_ADDRESS = "OSC Address"
+DEFAULT_DATAPATH = "Blender Full Data Path"
 
 # --- Module state ---
 _rx_thread = None
@@ -36,16 +35,21 @@ _last_keyed_frame: Dict[str, int] = {}
 
 # --- Minimal OSC parsing with bundle support and f/i/d ---
 
-def _pad4(n): return (4 - (n % 4)) % 4
+
+def _pad4(n):
+    return (4 - (n % 4)) % 4
+
 
 def _parse_msg(buf: bytes):
     i0 = buf.find(b"\x00")
-    if i0 < 0: raise ValueError("no addr nul")
+    if i0 < 0:
+        raise ValueError("no addr nul")
     addr = buf[:i0].decode("utf-8", "ignore")
     p = i0 + 1 + _pad4(i0 + 1)
 
     i1rel = buf[p:].find(b"\x00")
-    if i1rel < 0: raise ValueError("no typetags nul")
+    if i1rel < 0:
+        raise ValueError("no typetags nul")
     i1 = p + i1rel
     tags = buf[p:i1].decode("utf-8", "ignore")
     p = i1 + 1 + _pad4((i1 - 0) + 1)
@@ -55,30 +59,53 @@ def _parse_msg(buf: bytes):
     args = []
     for t in tags[1:]:
         if t == "f":
-            args.append(struct.unpack(">f", buf[p:p+4])[0]); p += 4
+            if p + 4 > len(buf):
+                raise ValueError("truncated float argument")
+            args.append(struct.unpack(">f", buf[p : p + 4])[0])
+            p += 4
         elif t == "i":
-            args.append(float(struct.unpack(">i", buf[p:p+4])[0])); p += 4
+            if p + 4 > len(buf):
+                raise ValueError("truncated int argument")
+            args.append(float(struct.unpack(">i", buf[p : p + 4])[0]))
+            p += 4
         elif t == "d":
-            args.append(struct.unpack(">d", buf[p:p+8])[0]); p += 8
+            if p + 8 > len(buf):
+                raise ValueError("truncated double argument")
+            args.append(struct.unpack(">d", buf[p : p + 8])[0])
+            p += 8
         else:
             raise ValueError(f"unsupported type {t!r}")
     return addr, args
 
+
 def _parse_osc(buf: bytes):
     if buf.startswith(b"#bundle\x00"):
+        if len(buf) < 16:
+            return
         p = 16  # "#bundle\0" (8) + timetag (8)
         while p + 4 <= len(buf):
-            (sz,) = struct.unpack(">i", buf[p:p+4]); p += 4
-            if sz <= 0 or p + sz > len(buf): break
-            msg = buf[p:p+sz]; p += sz
+            (sz,) = struct.unpack(">i", buf[p : p + 4])
+            p += 4
+            if sz <= 0 or p + sz > len(buf):
+                break
+            msg = buf[p : p + sz]
+            p += sz
             try:
                 yield _parse_msg(msg)
-            except Exception:
+            except Exception as exc:
+                if DEBUG:
+                    print(f"[OSC] Ignored malformed bundled message: {exc}")
                 continue
     else:
-        yield _parse_msg(buf)
+        try:
+            yield _parse_msg(buf)
+        except Exception as exc:
+            if DEBUG:
+                print(f"[OSC] Ignored malformed message: {exc}")
+
 
 # --- Network listener thread ---
+
 
 def _listener():
     global _last_value, _sock
@@ -87,7 +114,8 @@ def _listener():
         _sock = sock
         sock.bind((_current_host, _current_port))
         sock.settimeout(0.1)
-        if DEBUG: print(f"[OSC] Listening {_current_host}:{_current_port}")
+        if DEBUG:
+            print(f"[OSC] Listening {_current_host}:{_current_port}")
     except Exception as e:
         print(f"[OSC] Failed to bind {_current_host}:{_current_port} -> {e}")
         return
@@ -108,14 +136,20 @@ def _listener():
                         _last_value = v
                         _rx_values[addr] = v
                         # No hold-last: do not track last values
-                    if DEBUG: print(f"[OSC] {addr} {v}")
+                    if DEBUG:
+                        print(f"[OSC] {addr} {v}")
     finally:
-        try: sock.close()
-        except: pass
+        try:
+            sock.close()
+        except Exception:
+            pass
         _sock = None
-        if DEBUG: print("[OSC] Socket closed")
+        if DEBUG:
+            print("[OSC] Socket closed")
+
 
 # --- Continuous apply timer (always while running) ---
+
 
 def _apply_timer():
     if _stop_flag:
@@ -141,16 +175,18 @@ def _apply_timer():
     mappings = getattr(scn, "oscrec_mappings", [])
     did_apply_any = False
     for item in mappings:
+        if not _mapping_is_ready(item):
+            continue
         # Skip disabled mappings
         try:
             if hasattr(item, "enabled") and not item.enabled:
                 continue
         except Exception:
             pass
-        addr = item.address
+        addr = item.address.strip()
         # Normalize mapping address to start with '/'
-        if addr and not addr.startswith('/'):
-            addr = '/' + addr
+        if addr and not addr.startswith("/"):
+            addr = "/" + addr
         # Only apply if we have a fresh value for this address in this tick
         val = _snapshot_rx.get(addr)
         if val is None:
@@ -195,12 +231,24 @@ def _apply_timer():
     try:
         with _lock:
             lv = _last_value
-        wm.oscrec_last_value_text = (f"{lv:.4f}" if lv is not None else "")
+        wm.oscrec_last_value_text = f"{lv:.4f}" if lv is not None else ""
     except Exception:
         pass
     # Ping UI to redraw so status updates
     _redraw_editors()
     return APPLY_INTERVAL
+
+
+def _mapping_is_ready(item) -> bool:
+    address = getattr(item, "address", "").strip()
+    datapath = getattr(item, "datapath", "").strip()
+    return (
+        bool(address)
+        and bool(datapath)
+        and address != DEFAULT_OSC_ADDRESS
+        and datapath != DEFAULT_DATAPATH
+    )
+
 
 def _split_expr_index(expr: str):
     """Split a trailing [index] from a full python-style expression.
@@ -208,16 +256,17 @@ def _split_expr_index(expr: str):
     if expr.endswith("]"):
         lb = expr.rfind("[")
         if lb != -1:
-            idx_str = expr[lb+1:-1]
+            idx_str = expr[lb + 1 : -1]
             if idx_str.isdigit():
                 return expr[:lb], int(idx_str)
     return expr, None
+
 
 def _find_last_attr_dot(expr: str) -> int:
     """Return index of the last attribute dot (.) not inside brackets or quotes; -1 if none."""
     depth = 0
     in_str = False
-    str_ch = ''
+    str_ch = ""
     last_dot = -1
     i = 0
     while i < len(expr):
@@ -231,14 +280,15 @@ def _find_last_attr_dot(expr: str) -> int:
             if ch in ('"', "'"):
                 in_str = True
                 str_ch = ch
-            elif ch == '[':
+            elif ch == "[":
                 depth += 1
-            elif ch == ']':
+            elif ch == "]":
                 depth = max(0, depth - 1)
-            elif ch == '.' and depth == 0:
+            elif ch == "." and depth == 0:
                 last_dot = i
         i += 1
     return last_dot
+
 
 def _split_owner_and_attr(base_expr: str):
     """Split owner python expr and attribute name from a base expression without [index]."""
@@ -247,17 +297,20 @@ def _split_owner_and_attr(base_expr: str):
         # e.g. base_expr could be just an attribute on a top-level object without dot (unlikely)
         raise ValueError(f"Cannot determine owner for expression: {base_expr}")
     owner_expr = base_expr[:dot]
-    attr = base_expr[dot+1:]
+    attr = base_expr[dot + 1 :]
     return owner_expr, attr
 
+
 def _eval_expr(expr: str):
-    return eval(expr, {"__builtins__": {} , "bpy": bpy}, {})
+    return eval(expr, {"__builtins__": {}, "bpy": bpy}, {})
+
 
 def _assign_abs_expr(abs_expr: str, value):
     """Assign to an absolute Python/RNA expression safely, e.g.
     bpy.data.objects["Cube"].modifiers["Array"]["Socket_5"] = value
     """
     exec(f"{abs_expr} = __v", {"__builtins__": {}, "bpy": bpy, "__v": value}, {})
+
 
 def _resolve_owner_attr_idx(abs_expr: str):
     """From an absolute expression like bpy.data.objects["Cube"].rotation_euler[2]
@@ -267,14 +320,6 @@ def _resolve_owner_attr_idx(abs_expr: str):
     owner = _eval_expr(owner_expr)
     return owner, attr, idx
 
-def _set_absolute_datapath_value(abs_expr: str, value: float):
-    owner, attr, idx = _resolve_owner_attr_idx(abs_expr)
-    if idx is None:
-        # scalar property
-        setattr(owner, attr, value)
-    else:
-        vec = getattr(owner, attr)
-        vec[idx] = value
 
 def _tokenize_abs_expr(expr: str):
     """Tokenize an absolute expression into name/attr/index tokens for progressive evaluation."""
@@ -283,68 +328,72 @@ def _tokenize_abs_expr(expr: str):
     n = len(expr)
     while i < n:
         ch = expr[i]
-        if ch == '.':
+        if ch == ".":
             # attribute token after dot
             i += 1
             j = i
-            while j < n and (expr[j].isalnum() or expr[j] == '_'):
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
                 j += 1
-            tokens.append(('attr', expr[i:j]))
+            tokens.append(("attr", expr[i:j]))
             i = j
-        elif ch == '[':
+        elif ch == "[":
             # bracket/index token, handle nested brackets and quoted strings
             start = i
             i += 1
             depth = 1
             in_str = False
-            str_ch = ''
+            str_ch = ""
             while i < n and depth > 0:
                 c = expr[i]
                 if in_str:
                     if c == str_ch:
                         in_str = False
-                    elif c == '\\' and i + 1 < n:
+                    elif c == "\\" and i + 1 < n:
                         i += 1
                 else:
                     if c in ('"', "'"):
                         in_str = True
                         str_ch = c
-                    elif c == '[':
+                    elif c == "[":
                         depth += 1
-                    elif c == ']':
+                    elif c == "]":
                         depth -= 1
                 i += 1
-            tokens.append(('index', expr[start:i]))
+            tokens.append(("index", expr[start:i]))
         else:
             # initial name token (e.g., bpy)
             j = i
-            while j < n and (expr[j].isalnum() or expr[j] == '_'):
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
                 j += 1
-            tokens.append(('name', expr[i:j]))
+            tokens.append(("name", expr[i:j]))
             i = j
     return tokens
+
 
 def _join_tokens(tokens, start: int, end: int):
     out = []
     for k in range(start, end):
         kind, val = tokens[k]
-        if kind == 'name':
+        if kind == "name":
             out.append(val)
-        elif kind == 'attr':
-            out.append('.'); out.append(val)
+        elif kind == "attr":
+            out.append(".")
+            out.append(val)
         else:
             out.append(val)
-    return ''.join(out)
+    return "".join(out)
+
 
 def _split_datapath_and_index(dp: str):
     """Split trailing numeric [index] from a Blender data_path string."""
-    if dp.endswith(']'):
-        lb = dp.rfind('[')
+    if dp.endswith("]"):
+        lb = dp.rfind("[")
         if lb != -1:
-            inner = dp[lb+1:-1]
+            inner = dp[lb + 1 : -1]
             if inner.isdigit():
                 return dp[:lb], int(inner)
     return dp, None
+
 
 def _resolve_id_owner_and_datapath(abs_expr: str):
     """Return (id_owner, data_path, index_or_None) suitable for keyframe_insert.
@@ -353,12 +402,12 @@ def _resolve_id_owner_and_datapath(abs_expr: str):
     id_owner = None
     id_owner_tok_index = -1
     for k in range(len(tokens)):
-        prefix = _join_tokens(tokens, 0, k+1)
+        prefix = _join_tokens(tokens, 0, k + 1)
         try:
             obj = _eval_expr(prefix)
         except Exception:
             break
-        if hasattr(obj, 'keyframe_insert') or hasattr(obj, 'animation_data'):
+        if hasattr(obj, "keyframe_insert") or hasattr(obj, "animation_data"):
             id_owner = obj
             id_owner_tok_index = k
     if id_owner is None:
@@ -368,10 +417,11 @@ def _resolve_id_owner_and_datapath(abs_expr: str):
     # Suffix data_path from remaining tokens
     dp = _join_tokens(tokens, id_owner_tok_index + 1, len(tokens))
     # Remove a leading '.' if the first remaining token is an attribute
-    if dp.startswith('.'):
+    if dp.startswith("."):
         dp = dp[1:]
     data_path, idx = _split_datapath_and_index(dp)
     return id_owner, data_path, idx
+
 
 def _coerce_for_target(owner, attr: str, idx, value_f: float):
     # Determine target RNA type when AUTO
@@ -399,16 +449,17 @@ def _coerce_for_target(owner, attr: str, idx, value_f: float):
     if isinstance(target, str):
         t = target
     else:
-        t = target.__name__ if hasattr(target, '__name__') else str(target)
+        t = target.__name__ if hasattr(target, "__name__") else str(target)
     t = t.upper()
-    if 'BOOL' in t:
+    if "BOOL" in t:
         return bool(value_f > 0.0)
-    if 'INT' in t:
+    if "INT" in t:
         return int(round(value_f))
     # ENUM and others: cast to int index when close to int; else pass float
-    if 'ENUM' in t:
+    if "ENUM" in t:
         return int(round(value_f))
     return float(value_f)
+
 
 def _coerce_for_target_abs(abs_expr: str, value_f: float):
     """Coerce based on the current value type at abs_expr. Works for bracketed datapaths."""
@@ -433,10 +484,11 @@ def _coerce_for_target_abs(abs_expr: str, value_f: float):
     except Exception:
         return value_f
 
+
 def _apply_mapping_value(item, value_f: float):
     owner, attr, idx = _resolve_owner_attr_idx(item.datapath)
     # If attr contains bracketed access, use direct expression assignment to support collections
-    if ('[' in attr) or (']' in attr):
+    if ("[" in attr) or ("]" in attr):
         coerced = _coerce_for_target_abs(item.datapath, value_f)
         _assign_abs_expr(item.datapath, coerced)
         _force_owner_update(owner)
@@ -449,6 +501,7 @@ def _apply_mapping_value(item, value_f: float):
         vec[idx] = coerced
     _force_owner_update(owner)
 
+
 def _insert_keyframe_for_absolute(abs_expr: str, frame: int):
     owner, data_path, idx = _resolve_id_owner_and_datapath(abs_expr)
     if idx is None:
@@ -458,23 +511,31 @@ def _insert_keyframe_for_absolute(abs_expr: str, frame: int):
     try:
         wm = bpy.context.window_manager if bpy.context is not None else None
         if wm and getattr(wm, "oscrec_record_keys", False):
-            _set_fcurve_mute_for_path(owner, data_path, (idx if idx is not None else 0), True)
+            _set_fcurve_mute_for_path(
+                owner, data_path, (idx if idx is not None else 0), True
+            )
     except Exception:
         pass
+
 
 def _get_fcurve(id_owner, data_path: str, array_index: int):
     ad = getattr(id_owner, "animation_data", None)
     if not ad or not ad.action:
         return None
-    for fc in ad.action.fcurves:
+    fcurves = getattr(ad.action, "fcurves", None)
+    if fcurves is None:
+        return None
+    for fc in fcurves:
         if fc.data_path == data_path and fc.array_index == array_index:
             return fc
     return None
+
 
 def _set_fcurve_mute_for_path(id_owner, data_path: str, array_index: int, mute: bool):
     fc = _get_fcurve(id_owner, data_path, array_index)
     if fc is not None:
         fc.mute = mute
+
 
 def _set_fcurve_mute_for_absolute(abs_expr: str, mute: bool):
     try:
@@ -486,12 +547,16 @@ def _set_fcurve_mute_for_absolute(abs_expr: str, mute: bool):
     except Exception:
         pass
 
+
 def _apply_mute_state_all(scn, mute: bool):
     try:
         for item in getattr(scn, "oscrec_mappings", []):
+            if not _mapping_is_ready(item):
+                continue
             _set_fcurve_mute_for_absolute(item.datapath, mute)
     except Exception:
         pass
+
 
 def _redraw_editors():
     try:
@@ -499,23 +564,25 @@ def _redraw_editors():
         if not scr:
             return
         for area in scr.areas:
-            if area.type in {'GRAPH_EDITOR', 'DOPESHEET_EDITOR', 'VIEW_3D', 'TIMELINE'}:
+            if area.type in {"GRAPH_EDITOR", "DOPESHEET_EDITOR", "VIEW_3D", "TIMELINE"}:
                 area.tag_redraw()
     except Exception:
         pass
+
 
 def _force_owner_update(owner):
     """Tag the relevant ID datablock for update. Depsgraph update is batched per tick."""
     # Tag the relevant ID datablock for update
     try:
-        owner.update_tag(refresh={'DATA'})
+        owner.update_tag(refresh={"DATA"})
     except Exception:
         try:
-            id_owner = getattr(owner, 'id_data', None)
+            id_owner = getattr(owner, "id_data", None)
             if id_owner is not None:
-                id_owner.update_tag(refresh={'DATA'})
+                id_owner.update_tag(refresh={"DATA"})
         except Exception:
             pass
+
 
 def _set_playback_running(should_play: bool):
     try:
@@ -523,12 +590,13 @@ def _set_playback_running(should_play: bool):
         if not scr:
             return
         playing = scr.is_animation_playing
-        if should_play and not playing:
-            bpy.ops.screen.animation_play()
-        elif not should_play and playing:
+        if should_play == playing:
+            return
+        if bpy.ops.screen.animation_play.poll():
             bpy.ops.screen.animation_play()
     except Exception:
         pass
+
 
 def _record_toggle_update(self, context):
     wm = context.window_manager
@@ -540,7 +608,9 @@ def _record_toggle_update(self, context):
         _apply_mute_state_all(scn, False)
     _redraw_editors()
 
+
 # --- Toggle logic via a BoolProperty with update callback ---
+
 
 def _start_system():
     global _rx_thread, _stop_flag, _current_host, _current_port
@@ -563,12 +633,14 @@ def _start_system():
         bpy.app.timers.unregister(_apply_timer)
     except Exception:
         pass
-    bpy.app.timers.register(_apply_timer, first_interval=APPLY_INTERVAL, persistent=True)
+    bpy.app.timers.register(
+        _apply_timer, first_interval=APPLY_INTERVAL, persistent=True
+    )
     print(f"[OSC] Active on {_current_host}:{_current_port}")
 
 
 def _stop_system():
-    global _stop_flag, _rx_thread, _sock
+    global _last_value, _rx_thread, _sock, _stop_flag
     _stop_flag = True
     # Force-break the listener by closing the socket immediately
     try:
@@ -594,7 +666,7 @@ def _stop_system():
     try:
         with _lock:
             _rx_values.clear()
-            globals()['_last_value'] = None
+            _last_value = None
     except Exception:
         pass
     # Turn off recording toggle and unmute curves
@@ -620,6 +692,7 @@ def _toggle_update(self, context):
     else:
         _stop_system()
 
+
 def _host_port_update(self, context):
     """Restart listener if host/port change while running."""
     try:
@@ -629,11 +702,12 @@ def _host_port_update(self, context):
     except Exception:
         pass
 
+
 # --- UI Panel ---
 class OSCREC_PT_panel(bpy.types.Panel):
     bl_label = "Tiny OSC"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
     bl_category = "Tiny OSC"
 
     def draw(self, context):
@@ -642,16 +716,16 @@ class OSCREC_PT_panel(bpy.types.Panel):
         scn = context.scene
         col = layout.column(align=True)
         # Network Address & Port
-        #col.label(text="Network:")
+        # col.label(text="Network:")
         row_net = col.row(align=True)
         row_net.prop(scn, "oscrec_host", text="")
         row_net.prop(scn, "oscrec_port", text="")
         # Start/Stop toggle
         col.prop(wm, "oscrec_running", text="Listen", toggle=True)
-        #col.separator()
+        # col.separator()
         # Record toggle (only available when running)
         row = col.row(align=True)
-        row.enabled = (wm.oscrec_running and len(scn.oscrec_mappings) > 0)
+        row.enabled = wm.oscrec_running and len(scn.oscrec_mappings) > 0
         row.prop(wm, "oscrec_record_keys", text="Bake Keyframes", toggle=True)
         col.separator()
         # Mapping list
@@ -662,7 +736,7 @@ class OSCREC_PT_panel(bpy.types.Panel):
             # Backward compatibility: initialize name if empty
             if not getattr(item, "name", ""):
                 try:
-                    item.name = f"Mapping {i+1}"
+                    item.name = f"Mapping {i + 1}"
                 except Exception:
                     pass
             # Foldout toggle
@@ -670,24 +744,35 @@ class OSCREC_PT_panel(bpy.types.Panel):
                 item,
                 "expanded",
                 text="",
-                icon=('DOWNARROW_HLT' if getattr(item, 'expanded', True) else 'RIGHTARROW'),
+                icon=(
+                    "DOWNARROW_HLT" if getattr(item, "expanded", True) else "RIGHTARROW"
+                ),
                 emboss=False,
             )
-            header.label(icon='LINKED')
+            header.label(icon="LINKED")
             header.prop(item, "name", text="")
-            header.prop(item, "enabled", text="", icon=('HIDE_OFF' if item.enabled else 'HIDE_ON'), icon_only=True, emboss=False)
-            op = header.operator("oscrec.mapping_remove", text="", icon='X', emboss=False)
+            header.prop(
+                item,
+                "enabled",
+                text="",
+                icon=("HIDE_OFF" if item.enabled else "HIDE_ON"),
+                icon_only=True,
+                emboss=False,
+            )
+            op = header.operator(
+                "oscrec.mapping_remove", text="", icon="X", emboss=False
+            )
             op.index = i
             # Fields underneath (only visible when expanded)
             if getattr(item, "expanded", True):
                 group.separator()
                 sub = group.column(align=True)
-                sub.prop(item, "address", text="Address")
-                sub.prop(item, "datapath", text="Data Path")
+                sub.prop(item, "address", text="")
+                sub.prop(item, "datapath", text="")
             # Add spacing after each mapping box for visual separation
             col.separator()
         # Add button under last mapping; spacing now consistent
-        col.operator("oscrec.mapping_add", text="", icon='ADD')
+        col.operator("oscrec.mapping_add", text="", icon="ADD")
         col.separator()
         try:
             txt = getattr(wm, "oscrec_last_value_text", "")
@@ -698,10 +783,11 @@ class OSCREC_PT_panel(bpy.types.Panel):
             try:
                 with _lock:
                     lv = _last_value
-                txt = (f"{lv:.4f}" if lv is not None else "")
+                txt = f"{lv:.4f}" if lv is not None else ""
             except Exception:
                 pass
         col.label(text=f"Received: {txt}", icon="INFO_LARGE")
+
 
 # --- Registration ---
 class OSCREC_PG_Mapping(bpy.types.PropertyGroup):
@@ -716,26 +802,27 @@ class OSCREC_PG_Mapping(bpy.types.PropertyGroup):
         default=True,
     )
     enabled: bpy.props.BoolProperty(
-        name="Mute",
-        description="Mute/unmute this mapping",
+        name="Enabled",
+        description="Enable this mapping",
         default=True,
     )
     address: bpy.props.StringProperty(
-        name="Address",
+        name="OSC Address",
         description="The address to listen to.",
-        default="",
+        default=DEFAULT_OSC_ADDRESS,
     )
     datapath: bpy.props.StringProperty(
-        name="Data Path",
+        name="Blender Full Data Path",
         description="The full data path to map to.",
-        default="",
+        default=DEFAULT_DATAPATH,
     )
     # Cast mode removed; conversion is auto-inferred from target RNA/property.
+
 
 class OSCREC_OT_mapping_add(bpy.types.Operator):
     bl_idname = "oscrec.mapping_add"
     bl_label = "Add Mapping"
-    bl_options = {'INTERNAL', 'UNDO'}
+    bl_options = {"INTERNAL", "UNDO"}
     bl_description = "Add a new OSC mapping."
 
     def execute(self, context):
@@ -748,13 +835,14 @@ class OSCREC_OT_mapping_add(bpy.types.Operator):
         except Exception:
             pass
         scn.oscrec_mappings_index = len(scn.oscrec_mappings) - 1
-        return {'FINISHED'}
+        return {"FINISHED"}
+
 
 class OSCREC_OT_mapping_remove(bpy.types.Operator):
     bl_idname = "oscrec.mapping_remove"
     bl_label = "Remove"
     bl_description = "Remove this mapping."
-    bl_options = {'INTERNAL', 'UNDO'}
+    bl_options = {"INTERNAL", "UNDO"}
 
     index: bpy.props.IntProperty(default=-1)
 
@@ -764,7 +852,8 @@ class OSCREC_OT_mapping_remove(bpy.types.Operator):
         if 0 <= idx < len(scn.oscrec_mappings):
             scn.oscrec_mappings.remove(idx)
             scn.oscrec_mappings_index = min(idx, len(scn.oscrec_mappings) - 1)
-        return {'FINISHED'}
+        return {"FINISHED"}
+
 
 classes = (
     OSCREC_PG_Mapping,
@@ -772,6 +861,7 @@ classes = (
     OSCREC_OT_mapping_remove,
     OSCREC_PT_panel,
 )
+
 
 def register():
     for c in classes:
@@ -802,9 +892,13 @@ def register():
         default=False,
         update=_record_toggle_update,
     )
-    bpy.types.Scene.oscrec_mappings = bpy.props.CollectionProperty(type=OSCREC_PG_Mapping)
+    bpy.types.Scene.oscrec_mappings = bpy.props.CollectionProperty(
+        type=OSCREC_PG_Mapping
+    )
     bpy.types.Scene.oscrec_mappings_index = bpy.props.IntProperty(default=-1)
-    bpy.types.WindowManager.oscrec_last_value_text = bpy.props.StringProperty(default="")
+    bpy.types.WindowManager.oscrec_last_value_text = bpy.props.StringProperty(
+        default=""
+    )
 
 
 def unregister():
@@ -815,7 +909,10 @@ def unregister():
         _stop_system()
     # Remove UI + properties
     for c in reversed(classes):
-        bpy.utils.unregister_class(c)
+        try:
+            bpy.utils.unregister_class(c)
+        except RuntimeError:
+            pass
     if hasattr(bpy.types.WindowManager, "oscrec_running"):
         del bpy.types.WindowManager.oscrec_running
     if hasattr(bpy.types.Scene, "oscrec_host"):
@@ -830,6 +927,7 @@ def unregister():
         del bpy.types.Scene.oscrec_mappings_index
     if hasattr(bpy.types.WindowManager, "oscrec_last_value_text"):
         del bpy.types.WindowManager.oscrec_last_value_text
+
 
 if __name__ == "__main__":
     register()

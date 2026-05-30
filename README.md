@@ -11,8 +11,8 @@ The add-on applies incoming OSC values continuously at ~60 Hz. Received values a
 
 ## Making Mappings
 - Click on the + button to add a new mapping.
-- Enter the **Address**. In TouchDesigner this is the channel name being sent over OSC.
-- Enter the **Blender Data Path**. The easiest way is to right-click a property in Blender and choose **Copy Full Data Path**.
+- Enter the **OSC Address**. In TouchDesigner this is the channel name being sent over OSC.
+- Enter the **Blender Full Data Path**. The easiest way is to right-click a property in Blender and choose **Copy Full Data Path**.
 
 You can target most Blender properties. Just try it.
 
