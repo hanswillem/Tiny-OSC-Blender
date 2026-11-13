@@ -19,6 +19,7 @@ from typing import Dict
 # --- Config ---
 DEBUG = False  # set True for console logs
 APPLY_INTERVAL = 0.016  # seconds; ~60 Hz continuous application
+OSC_HOST = "127.0.0.1"  # localhost only
 DEFAULT_OSC_ADDRESS = "OSC Address"
 DEFAULT_DATAPATH = "Blender Full Data Path"
 
@@ -27,7 +28,6 @@ _rx_thread = None
 _stop_flag = False
 _lock = threading.Lock()
 _last_value = None
-_current_host = "localhost"
 _current_port = 10000
 _rx_values: Dict[str, float] = {}
 _sock = None
@@ -112,12 +112,12 @@ def _listener():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         _sock = sock
-        sock.bind((_current_host, _current_port))
+        sock.bind((OSC_HOST, _current_port))
         sock.settimeout(0.1)
         if DEBUG:
-            print(f"[OSC] Listening {_current_host}:{_current_port}")
+            print(f"[OSC] Listening {OSC_HOST}:{_current_port}")
     except Exception as e:
-        print(f"[OSC] Failed to bind {_current_host}:{_current_port} -> {e}")
+        print(f"[OSC] Failed to bind {OSC_HOST}:{_current_port} -> {e}")
         return
 
     try:
@@ -613,18 +613,15 @@ def _record_toggle_update(self, context):
 
 
 def _start_system():
-    global _rx_thread, _stop_flag, _current_host, _current_port
+    global _rx_thread, _stop_flag, _current_port
     _stop_flag = False
-    # Read the desired host/port from UI properties if available
+    # Read the desired port from UI properties if available
     try:
         scn = bpy.context.scene if bpy.context is not None else None
         if scn is not None:
-            _current_host = getattr(scn, "oscrec_host", _current_host)
             _current_port = int(getattr(scn, "oscrec_port", _current_port))
-        else:
-            _current_host, _current_port = _current_host, _current_port
     except Exception:
-        _current_host, _current_port = _current_host, _current_port
+        pass
     if _rx_thread is None or not _rx_thread.is_alive():
         _rx_thread = threading.Thread(target=_listener, name="OSC_RX", daemon=True)
         _rx_thread.start()
@@ -636,7 +633,7 @@ def _start_system():
     bpy.app.timers.register(
         _apply_timer, first_interval=APPLY_INTERVAL, persistent=True
     )
-    print(f"[OSC] Active on {_current_host}:{_current_port}")
+    print(f"[OSC] Active on {OSC_HOST}:{_current_port}")
 
 
 def _stop_system():
@@ -693,8 +690,8 @@ def _toggle_update(self, context):
         _stop_system()
 
 
-def _host_port_update(self, context):
-    """Restart listener if host/port change while running."""
+def _port_update(self, context):
+    """Restart listener if the port changes while running."""
     try:
         if context.window_manager.oscrec_running:
             _stop_system()
@@ -715,18 +712,14 @@ class OSCREC_PT_panel(bpy.types.Panel):
         wm = context.window_manager
         scn = context.scene
         col = layout.column(align=True)
-        # Network Address & Port
-        # col.label(text="Network:")
-        row_net = col.row(align=True)
-        row_net.prop(scn, "oscrec_host", text="")
-        row_net.prop(scn, "oscrec_port", text="")
+        # Localhost UDP port
+        col.label(text="Connection:")
+        col.prop(scn, "oscrec_port", text="")
         # Start/Stop toggle
         col.prop(wm, "oscrec_running", text="Listen", toggle=True)
-        # col.separator()
-        # Record toggle (only available when running)
-        row = col.row(align=True)
-        row.enabled = wm.oscrec_running and len(scn.oscrec_mappings) > 0
-        row.prop(wm, "oscrec_record_keys", text="Bake Keyframes", toggle=True)
+        col.separator()
+        col.label(text="Mappings:")
+        col.operator("oscrec.mapping_add", text="", icon="ADD")
         col.separator()
         # Mapping list
         for i, item in enumerate(scn.oscrec_mappings):
@@ -768,11 +761,19 @@ class OSCREC_PT_panel(bpy.types.Panel):
                 group.separator()
                 sub = group.column(align=True)
                 sub.prop(item, "address", text="")
-                sub.prop(item, "datapath", text="")
+                path_row = sub.row(align=True)
+                path_row.prop(item, "datapath", text="")
+                picker = path_row.operator(
+                    "oscrec.pick_datapath", text="", icon="EYEDROPPER"
+                )
+                picker.index = i
             # Add spacing after each mapping box for visual separation
             col.separator()
-        # Add button under last mapping; spacing now consistent
-        col.operator("oscrec.mapping_add", text="", icon="ADD")
+        col.label(text="Record:")
+        # Record toggle (only available when running)
+        row = col.row(align=True)
+        row.enabled = wm.oscrec_running and len(scn.oscrec_mappings) > 0
+        row.prop(wm, "oscrec_record_keys", text="Bake Keyframes", toggle=True)
         col.separator()
         try:
             txt = getattr(wm, "oscrec_last_value_text", "")
@@ -819,6 +820,75 @@ class OSCREC_PG_Mapping(bpy.types.PropertyGroup):
     # Cast mode removed; conversion is auto-inferred from target RNA/property.
 
 
+class OSCREC_OT_pick_datapath(bpy.types.Operator):
+    bl_idname = "oscrec.pick_datapath"
+    bl_label = "Pick Blender Property"
+    bl_description = "Click a numeric property to capture its full data path; Esc cancels"
+    bl_options = {"INTERNAL", "UNDO"}
+
+    index: bpy.props.IntProperty(default=-1)
+
+    def invoke(self, context, event):
+        if not 0 <= self.index < len(context.scene.oscrec_mappings):
+            return {"CANCELLED"}
+        self._mapping = context.scene.oscrec_mappings[self.index]
+        self._window = context.window
+        self._workspace = context.workspace
+        self._window.cursor_modal_set("EYEDROPPER")
+        self._workspace.status_text_set("Pick a numeric property • Left click to confirm • Esc to cancel")
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _finish(self):
+        self._window.cursor_modal_restore()
+        self._workspace.status_text_set(None)
+        _redraw_editors()
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            self._finish()
+            return {"CANCELLED"}
+        if event.type == "LEFTMOUSE":
+            if event.value != "PRESS":
+                return {"RUNNING_MODAL"}
+            # Let mouse moves reach Blender so the hovered UI property is active.
+            # Override the region because a modal operator retains its starting area.
+            for area in self._window.screen.areas:
+                for region in area.regions:
+                    if not (region.x <= event.mouse_x < region.x + region.width
+                            and region.y <= event.mouse_y < region.y + region.height):
+                        continue
+                    clipboard = context.window_manager.clipboard
+                    try:
+                        with context.temp_override(window=self._window, area=area, region=region):
+                            if not bpy.ops.ui.copy_data_path_button.poll():
+                                continue
+                            outcome = bpy.ops.ui.copy_data_path_button(full_path=True)
+                            if "FINISHED" not in outcome:
+                                continue
+                            path = context.window_manager.clipboard
+                        value = _eval_expr(path)
+                        if not isinstance(value, (float, int, bool)):
+                            self.report({"WARNING"}, "Pick a single numeric value, such as Location X")
+                            return {"RUNNING_MODAL"}
+                        self._mapping.datapath = path
+                    except (RuntimeError, ValueError, TypeError, ReferenceError, AttributeError, KeyError, IndexError) as exc:
+                        self.report({"WARNING"}, f"Cannot pick this property: {exc}")
+                        return {"RUNNING_MODAL"}
+                    finally:
+                        context.window_manager.clipboard = clipboard
+                    self._finish()
+                    return {"FINISHED"}
+            self.report({"WARNING"}, "Hover a numeric property and click to pick it")
+            return {"RUNNING_MODAL"}
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE", "WHEELUPMOUSE", "WHEELDOWNMOUSE", "MIDDLEMOUSE"}:
+            return {"PASS_THROUGH"}
+        return {"RUNNING_MODAL"}
+
+    def cancel(self, context):
+        self._finish()
+
+
 class OSCREC_OT_mapping_add(bpy.types.Operator):
     bl_idname = "oscrec.mapping_add"
     bl_label = "Add Mapping"
@@ -857,6 +927,7 @@ class OSCREC_OT_mapping_remove(bpy.types.Operator):
 
 classes = (
     OSCREC_PG_Mapping,
+    OSCREC_OT_pick_datapath,
     OSCREC_OT_mapping_add,
     OSCREC_OT_mapping_remove,
     OSCREC_PT_panel,
@@ -872,19 +943,13 @@ def register():
         default=False,
         update=_toggle_update,
     )
-    bpy.types.Scene.oscrec_host = bpy.props.StringProperty(
-        name="IP Address",
-        description="The network IP address to bind (use 0.0.0.0 for all interfaces)",
-        default=_current_host,
-        update=_host_port_update,
-    )
     bpy.types.Scene.oscrec_port = bpy.props.IntProperty(
         name="Port",
         description="UDP port to listen on",
         default=_current_port,
         min=1,
         max=65535,
-        update=_host_port_update,
+        update=_port_update,
     )
     bpy.types.WindowManager.oscrec_record_keys = bpy.props.BoolProperty(
         name="Record Keyframes",
@@ -915,8 +980,6 @@ def unregister():
             pass
     if hasattr(bpy.types.WindowManager, "oscrec_running"):
         del bpy.types.WindowManager.oscrec_running
-    if hasattr(bpy.types.Scene, "oscrec_host"):
-        del bpy.types.Scene.oscrec_host
     if hasattr(bpy.types.Scene, "oscrec_port"):
         del bpy.types.Scene.oscrec_port
     if hasattr(bpy.types.WindowManager, "oscrec_record_keys"):
