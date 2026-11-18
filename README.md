@@ -5,11 +5,11 @@ A small Blender add-on for receiving OSC messages and mapping them to Blender pr
 ## Installation & Setup
 1. Download **tiny_osc.py**, and install through Blender's preferences.
 2. Find it in the **N-Panel** of the viewport.
-3. Under **Connection:**, set the UDP port (default **10000**) and press **Listen**.
+3. Under **OSC input**, set the UDP port (default **10000**) and press **Listen**.
 
 Tiny OSC listens on **localhost (127.0.0.1)** only. Run your OSC sender on the same computer and send to this address and port.
 
-The add-on applies incoming OSC values continuously at ~60 Hz. Received values are shown at the bottom in real time for quick feedback.
+The **OSC input** heading shows whether the listener is off, waiting for OSC, receiving OSC, or idle. It also reports port errors. The add-on applies incoming OSC values continuously at ~60 Hz. Each expanded mapping shows its latest received value in parentheses after its address.
 
 ## Making Mappings
 - Under **Mappings:**, click the **+** button to add a new mapping. New mappings appear below it.

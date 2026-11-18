@@ -8,9 +8,12 @@ bl_info = {
     "category": "Animation",
 }
 
+import errno
+import re
 import socket
 import struct
 import threading
+import time
 
 import bpy
 
@@ -27,7 +30,9 @@ DEFAULT_DATAPATH = "Blender Full Data Path"
 _rx_thread = None
 _stop_flag = False
 _lock = threading.Lock()
-_last_value = None
+_last_packet_at = None
+_listener_status = "Starting"
+_mapping_values: Dict[str, float] = {}
 _current_port = 10000
 _rx_values: Dict[str, float] = {}
 _sock = None
@@ -108,15 +113,21 @@ def _parse_osc(buf: bytes):
 
 
 def _listener():
-    global _last_value, _sock
+    global _last_packet_at, _listener_status, _sock
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         _sock = sock
         sock.bind((OSC_HOST, _current_port))
         sock.settimeout(0.1)
+        _listener_status = "Waiting"
         if DEBUG:
             print(f"[OSC] Listening {OSC_HOST}:{_current_port}")
-    except Exception as e:
+    except OSError as e:
+        if sock is not None:
+            sock.close()
+        _sock = None
+        _listener_status = "Port in use" if e.errno == errno.EADDRINUSE else "Listener error"
         print(f"[OSC] Failed to bind {OSC_HOST}:{_current_port} -> {e}")
         return
 
@@ -127,15 +138,17 @@ def _listener():
             except socket.timeout:
                 continue
             except OSError:
+                if not _stop_flag:
+                    _listener_status = "Listener error"
                 break
 
             for addr, args in _parse_osc(data):
+                with _lock:
+                    _last_packet_at = time.monotonic()
                 if args:
                     v = float(args[0])
                     with _lock:
-                        _last_value = v
                         _rx_values[addr] = v
-                        # No hold-last: do not track last values
                     if DEBUG:
                         print(f"[OSC] {addr} {v}")
     finally:
@@ -158,12 +171,6 @@ def _apply_timer():
     wm = bpy.context.window_manager if bpy.context is not None else None
     scn = bpy.context.scene if bpy.context is not None else None
     if wm is None or scn is None or not getattr(wm, "oscrec_running", False):
-        # When stopped, clear last shown value so it's obvious nothing is being received
-        try:
-            if wm is not None:
-                wm.oscrec_last_value_text = ""
-        except Exception:
-            pass
         return APPLY_INTERVAL
 
     # Snapshot and clear received values so only fresh packets affect this tick
@@ -173,6 +180,11 @@ def _apply_timer():
 
     # Apply incoming values to each configured mapping (absolute datapaths)
     mappings = getattr(scn, "oscrec_mappings", [])
+    addresses = {_mapping_address(item) for item in mappings}
+    for addr in _mapping_values.keys() - addresses:
+        del _mapping_values[addr]
+    for addr in addresses & _snapshot_rx.keys():
+        _mapping_values[addr] = _snapshot_rx[addr]
     did_apply_any = False
     for item in mappings:
         if not _mapping_is_ready(item):
@@ -183,10 +195,7 @@ def _apply_timer():
                 continue
         except Exception:
             pass
-        addr = item.address.strip()
-        # Normalize mapping address to start with '/'
-        if addr and not addr.startswith("/"):
-            addr = "/" + addr
+        addr = _mapping_address(item)
         # Only apply if we have a fresh value for this address in this tick
         val = _snapshot_rx.get(addr)
         if val is None:
@@ -227,16 +236,29 @@ def _apply_timer():
     except Exception:
         pass
 
-    # Update status text while running
-    try:
-        with _lock:
-            lv = _last_value
-        wm.oscrec_last_value_text = f"{lv:.4f}" if lv is not None else ""
-    except Exception:
-        pass
     # Ping UI to redraw so status updates
     _redraw_editors()
     return APPLY_INTERVAL
+
+
+def _mapping_address(item):
+    address = item.address.strip()
+    return "/" + address if address and not address.startswith("/") else address
+
+
+def _connection_status(running):
+    if not running:
+        return "Off"
+    status = _listener_status
+    if status in {"Listener error", "Port in use"}:
+        return status
+    with _lock:
+        packet_at = _last_packet_at
+    if packet_at is None:
+        return status
+    if time.monotonic() - packet_at < 2.0:
+        return "Receiving"
+    return "Idle"
 
 
 def _mapping_is_ready(item) -> bool:
@@ -613,7 +635,7 @@ def _record_toggle_update(self, context):
 
 
 def _start_system():
-    global _rx_thread, _stop_flag, _current_port
+    global _rx_thread, _stop_flag, _current_port, _listener_status
     _stop_flag = False
     # Read the desired port from UI properties if available
     try:
@@ -623,6 +645,7 @@ def _start_system():
     except Exception:
         pass
     if _rx_thread is None or not _rx_thread.is_alive():
+        _listener_status = "Starting"
         _rx_thread = threading.Thread(target=_listener, name="OSC_RX", daemon=True)
         _rx_thread.start()
     # start/update timer (idempotent; re-registering is fine)
@@ -637,7 +660,7 @@ def _start_system():
 
 
 def _stop_system():
-    global _last_value, _rx_thread, _sock, _stop_flag
+    global _last_packet_at, _rx_thread, _sock, _stop_flag
     _stop_flag = True
     # Force-break the listener by closing the socket immediately
     try:
@@ -659,18 +682,18 @@ def _stop_system():
         _last_keyed_frame.clear()
     except Exception:
         pass
-    # Clear rx state so nothing holds last values
+    _mapping_values.clear()
+    # Clear activity for the next listen session
     try:
         with _lock:
             _rx_values.clear()
-            _last_value = None
+            _last_packet_at = None
     except Exception:
         pass
     # Turn off recording toggle and unmute curves
     try:
         wm = bpy.context.window_manager if bpy.context is not None else None
         if wm is not None:
-            wm.oscrec_last_value_text = ""
             wm.oscrec_record_keys = False
             _set_playback_running(False)
             scn = bpy.context.scene if bpy.context is not None else None
@@ -713,7 +736,7 @@ class OSCREC_PT_panel(bpy.types.Panel):
         scn = context.scene
         col = layout.column(align=True)
         # Localhost UDP port
-        col.label(text="Connection:")
+        col.label(text=f"OSC input: {_connection_status(wm.oscrec_running).lower()}")
         col.prop(scn, "oscrec_port", text="")
         # Start/Stop toggle
         col.prop(wm, "oscrec_running", text="Listen", toggle=True)
@@ -724,7 +747,7 @@ class OSCREC_PT_panel(bpy.types.Panel):
         # Mapping list
         for i, item in enumerate(scn.oscrec_mappings):
             group = col.column(align=True)
-            # Header row: fold toggle, link icon, name text field expands to fill, delete button at far right
+            # Header row: fold toggle, name text field expands to fill, delete button at far right
             header = group.row(align=True)
             # Backward compatibility: initialize name if empty
             if not getattr(item, "name", ""):
@@ -742,7 +765,6 @@ class OSCREC_PT_panel(bpy.types.Panel):
                 ),
                 emboss=False,
             )
-            header.label(icon="LINKED")
             header.prop(item, "name", text="")
             header.prop(
                 item,
@@ -760,7 +782,7 @@ class OSCREC_PT_panel(bpy.types.Panel):
             if getattr(item, "expanded", True):
                 group.separator()
                 sub = group.column(align=True)
-                sub.prop(item, "address", text="")
+                sub.prop(item, "address_display", text="")
                 path_row = sub.row(align=True)
                 path_row.prop(item, "datapath", text="")
                 picker = path_row.operator(
@@ -774,20 +796,6 @@ class OSCREC_PT_panel(bpy.types.Panel):
         row = col.row(align=True)
         row.enabled = wm.oscrec_running and len(scn.oscrec_mappings) > 0
         row.prop(wm, "oscrec_record_keys", text="Bake Keyframes", toggle=True)
-        col.separator()
-        try:
-            txt = getattr(wm, "oscrec_last_value_text", "")
-        except Exception:
-            txt = ""
-        # Fallback to in-memory last value if the UI property hasn't been updated yet
-        if not txt:
-            try:
-                with _lock:
-                    lv = _last_value
-                txt = f"{lv:.4f}" if lv is not None else ""
-            except Exception:
-                pass
-        col.label(text=f"Received: {txt}", icon="INFO_LARGE")
 
 
 # --- Registration ---
@@ -812,6 +820,23 @@ class OSCREC_PG_Mapping(bpy.types.PropertyGroup):
         description="The address to listen to.",
         default=DEFAULT_OSC_ADDRESS,
     )
+    def _get_address_display(self):
+        value = _mapping_values.get(_mapping_address(self))
+        return self.address if value is None else f"{self.address} ({value:.3f})"
+
+    def _set_address_display(self, text):
+        # The value may have changed while Blender's text editor was open.
+        # Parentheses without a preceding space can still be part of an OSC address.
+        self.address = re.sub(r" \((?:-?\d+\.\d{3}|-?inf|nan)\)$", "", text)
+
+    address_display: bpy.props.StringProperty(
+        name="OSC Address",
+        description="Edit the OSC address. The last received value appears in parentheses",
+        get=_get_address_display,
+        set=_set_address_display,
+        options={"SKIP_SAVE"},
+    )
+
     datapath: bpy.props.StringProperty(
         name="Blender Full Data Path",
         description="The full data path to map to.",
@@ -961,9 +986,6 @@ def register():
         type=OSCREC_PG_Mapping
     )
     bpy.types.Scene.oscrec_mappings_index = bpy.props.IntProperty(default=-1)
-    bpy.types.WindowManager.oscrec_last_value_text = bpy.props.StringProperty(
-        default=""
-    )
 
 
 def unregister():
@@ -988,8 +1010,6 @@ def unregister():
         del bpy.types.Scene.oscrec_mappings
     if hasattr(bpy.types.Scene, "oscrec_mappings_index"):
         del bpy.types.Scene.oscrec_mappings_index
-    if hasattr(bpy.types.WindowManager, "oscrec_last_value_text"):
-        del bpy.types.WindowManager.oscrec_last_value_text
 
 
 if __name__ == "__main__":
